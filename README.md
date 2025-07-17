@@ -10,8 +10,6 @@
 
 Profiling data is exposed through the `/proc` filesystem via a virtual file at `/proc/perftop`.
 
-This module was implemented for Assignment 7 in the context of a systems performance course, and builds upon the foundational work from Assignment 6.
-
 ---
 
 ## Features
@@ -20,7 +18,7 @@ This module was implemented for Assignment 7 in the context of a systems perform
 - **Stack trace-based tracking**: Tasks are uniquely identified by their kernel/user stack traces (instead of just PID).
 - **CPU time accounting**: Uses the `rdtsc` instruction to record how long a task runs while in the `TASK_RUNNING` state.
 - **Jenkins hash**: Used to hash stack traces for efficient lookup and aggregation.
-- **RB-tree integration** *(Optional Bonus)*: Maintains a ranked list of the top 20 most scheduled tasks.
+- **RB-tree integration** : Maintains a ranked list of the top 20 most scheduled tasks.
 
 ---
 
