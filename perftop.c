@@ -10,21 +10,25 @@
 #include <linux/sched.h>
 #include <linux/hash.h>
 #include <linux/timekeeping.h>
+#include <linux/rbtree.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Sabyasachi");
 MODULE_DESCRIPTION("CPU Profiler to track task scheduling time");
 
+static struct rb_root task_rb_tree = RB_ROOT;
 #define MAX_BUCKETS 10
 static DEFINE_HASHTABLE(task_table, MAX_BUCKETS);
 #define MAX_STACK_DEPTH 4
+#define MAX_TOP_TASKS 20
 
 struct task_entry {
+    struct hlist_node task_node;
+    struct rb_node rb_node;
     unsigned long stack[MAX_STACK_DEPTH];
-    u64 total_time;
+    unsigned long total_time;
     unsigned int last_scheduled_in;
     unsigned long task_hash;
-    struct hlist_node task_node;
 };
 
 static struct task_entry *find_task_entry(unsigned long hash) {
@@ -37,10 +41,41 @@ static struct task_entry *find_task_entry(unsigned long hash) {
     return NULL;
 }
 
+static void remove_task_rb(struct rb_root *root, struct task_entry *entry) {
+    rb_erase(&entry->rb_node, root);
+}
+
+static void insert_task_rb(struct rb_root *root, struct task_entry *new_entry) {
+    struct rb_node **link = &root->rb_node, *parent = NULL;
+
+    while (*link) {
+        struct task_entry *entry = container_of(*link, struct task_entry, rb_node);
+        parent = *link;
+
+        if (new_entry->total_time < entry->total_time)
+            link = &(*link)->rb_left;
+        else
+            link = &(*link)->rb_right;
+    }
+
+    rb_link_node(&new_entry->rb_node, parent, link);
+    rb_insert_color(&new_entry->rb_node, root);
+    new_entry->rb_node.rb_left = NULL;
+    new_entry->rb_node.rb_right = NULL;
+}
+
 static void update_task_time(unsigned long hash, u64 current_time) {
     struct task_entry *entry = find_task_entry(hash);
+    
+    if (entry == NULL) {
+        pr_warn ("NULL VALUE IN HASH");
+    }
+
     if (entry && entry->last_scheduled_in) {
         entry->total_time += current_time - entry->last_scheduled_in;
+        
+        remove_task_rb (&task_rb_tree, entry);
+        insert_task_rb (&task_rb_tree, entry);
     }
 }
 
@@ -62,16 +97,22 @@ static void insert_task_entry(unsigned long hash, unsigned long *stack, u64 curr
 
 static int perftop_proc_show(struct seq_file *m, void *v) {
     struct task_entry *entry;
-    int i;
+    struct rb_node *node;
+    int count = 0;
 
-    seq_puts(m, "Stack trace, Hash, Time Spent (rdtsc ticks)\n");
+    seq_puts(m, "Rank | Stack Hash | CPU Time (rdtsc ticks) | Stack Trace\n");
 
-    hash_for_each(task_table, i, entry, task_node) {
-        for (int j = 0; j < MAX_STACK_DEPTH; ++j) {
-            seq_printf(m, "\n0x%lx", entry->stack[j]);
-        }
-        seq_printf(m, ", %llu\n", entry->total_time);
+    for (node = rb_last(&task_rb_tree); node && count < MAX_TOP_TASKS; node = rb_prev(node), count++) {
+        entry = container_of(node, struct task_entry, rb_node);
+
+        seq_printf(m, "%d | %lu | %lu | ", count + 1, entry->task_hash, entry->total_time);
+
+        for (int i = 0; i < min (4, MAX_STACK_DEPTH); ++i)
+            seq_printf(m, "0x%lx ", entry->stack[i]);
+
+        seq_puts(m, "\n");
     }
+
     return 0;
 }
 
@@ -101,8 +142,7 @@ static int handler_pre(struct kprobe *p, struct pt_regs *regs) {
     if (depth > 0) {
         depth = min (depth, MAX_STACK_DEPTH);
         hash = full_name_hash(NULL, (unsigned char *)stack, depth * sizeof(unsigned long));
-        if (hash > 0)
-            insert_task_entry(hash, stack, current_time);
+        insert_task_entry(hash, stack, current_time);
     }
 
     prev_task_hash = hash;
@@ -139,7 +179,10 @@ static int __init perftop_init(void) {
         return -EINVAL;
     }
     stack_trace_save_ = (typ2)kp2.addr;
-
+    if (!stack_trace_save_user_ || !stack_trace_save_) {
+        pr_err("Stack trace functions not found!\n");
+        return -EINVAL;
+    }
     kp.symbol_name = "pick_next_task_fair";
     kp.pre_handler = handler_pre;
 
