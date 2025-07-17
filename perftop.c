@@ -8,25 +8,27 @@
 #include <linux/types.h>
 #include <linux/kprobes.h>
 #include <linux/sched.h>
-#include <linux/hash.h> 
+#include <linux/hash.h>
+#include <linux/timekeeping.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Sabyasachi");
-MODULE_DESCRIPTION("CPU Profiler to track task scheduling");
+MODULE_DESCRIPTION("CPU Profiler to track task scheduling time");
 
 #define MAX_BUCKETS 10
 static DEFINE_HASHTABLE(task_table, MAX_BUCKETS);
 #define MAX_STACK_DEPTH 4
 
-struct task_count {
+struct task_entry {
     unsigned long stack[MAX_STACK_DEPTH];
-    pid_t task_hash;
-    unsigned int count;
+    u64 total_time;
+    unsigned int last_scheduled_in;
+    unsigned long task_hash;
     struct hlist_node task_node;
 };
 
-struct task_count *find_task_count(u32 hash) {
-    struct task_count *entry;
+static struct task_entry *find_task_entry(unsigned long hash) {
+    struct task_entry *entry;
     hash_for_each_possible(task_table, entry, task_node, hash) {
         if (entry->task_hash == hash) {
             return entry;
@@ -35,47 +37,60 @@ struct task_count *find_task_count(u32 hash) {
     return NULL;
 }
 
-static void insert_task_count(unsigned long hash, unsigned long * stack) {
-    struct task_count *entry = find_task_count(hash);
+static void update_task_time(unsigned long hash, u64 current_time) {
+    struct task_entry *entry = find_task_entry(hash);
+    if (entry && entry->last_scheduled_in) {
+        entry->total_time += current_time - entry->last_scheduled_in;
+    }
+}
+
+static void insert_task_entry(unsigned long hash, unsigned long *stack, u64 current_time) {
+    struct task_entry *entry = find_task_entry(hash);
     
     if (!entry) {
-        entry = kzalloc(sizeof(*entry), GFP_ATOMIC);  // GFP_ATOMIC for interrupt-safe allocation
+        entry = kzalloc(sizeof(*entry), GFP_ATOMIC);
         if (!entry) return;
 
+        memcpy(entry->stack, stack, sizeof(unsigned long) * MAX_STACK_DEPTH);
+        entry->total_time = 0;
         entry->task_hash = hash;
-        memcpy (entry->stack, stack, sizeof (unsigned long) * MAX_STACK_DEPTH);
-        entry->count = 0;
         hash_add(task_table, &entry->task_node, hash);
     }
-    entry->count++;
+
+    entry->last_scheduled_in = current_time;
 }
 
 static int perftop_proc_show(struct seq_file *m, void *v) {
-    struct task_count *entry;
+    struct task_entry *entry;
     int i;
 
-    seq_puts(m, "Stack trace, Stack trace hash, Scheduled Count\n");
+    seq_puts(m, "Stack trace, Hash, Time Spent (rdtsc ticks)\n");
 
     hash_for_each(task_table, i, entry, task_node) {
-        for (int i = 0; i < MAX_STACK_DEPTH; ++i) {
-            seq_printf (m, "\n%ld", entry->stack[i]);
+        for (int j = 0; j < MAX_STACK_DEPTH; ++j) {
+            seq_printf(m, "\n0x%lx", entry->stack[j]);
         }
-        seq_printf(m, "    %d    %u\n", entry->task_hash, entry->count);
+        seq_printf(m, ", %llu\n", entry->total_time);
     }
     return 0;
 }
 
-typedef unsigned long (*typ1) (unsigned long *, unsigned int);
-typedef unsigned long (*typ2) (unsigned long *, unsigned int, unsigned int);
+typedef unsigned long (*typ1)(unsigned long *, unsigned int);
+typedef unsigned long (*typ2)(unsigned long *, unsigned int, unsigned int);
 static typ1 stack_trace_save_user_;
 static typ2 stack_trace_save_;
 
 static int handler_pre(struct kprobe *p, struct pt_regs *regs) {
+    static unsigned long prev_task_hash = 0;
     unsigned long stack[MAX_STACK_DEPTH];
     int depth = 0;
+    u64 current_time = rdtsc();
     unsigned long hash;
 
     struct task_struct *task = current;
+    if (prev_task_hash) {
+        update_task_time(prev_task_hash, current_time);
+    }
 
     if (task->mm) {
         depth = stack_trace_save_user_(stack, MAX_STACK_DEPTH);
@@ -84,10 +99,13 @@ static int handler_pre(struct kprobe *p, struct pt_regs *regs) {
     }
 
     if (depth > 0) {
+        depth = min (depth, MAX_STACK_DEPTH);
         hash = full_name_hash(NULL, (unsigned char *)stack, depth * sizeof(unsigned long));
-        insert_task_count(hash, stack);  // Store PID instead of hash
+        if (hash > 0)
+            insert_task_entry(hash, stack, current_time);
     }
 
+    prev_task_hash = hash;
     return 0;
 }
 
@@ -137,7 +155,7 @@ static int __init perftop_init(void) {
 }
 
 static void __exit perftop_exit(void) {
-    struct task_count *entry;
+    struct task_entry *entry;
     struct hlist_node *tmp;
     int bkt;
 
